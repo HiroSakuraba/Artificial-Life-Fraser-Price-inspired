@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 
 use fl_core::nn::{is_recurrent, layer_dims, CATALOG, INPUT_WIDTH, MEMORY_WIDTH, OUTPUT_WIDTH};
+use fl_core::genome::Weights;
 use fl_core::field::Field;
 use fl_core::sources::Source;
 use fl_core::{Config, ControllerBackend, FieldAccounting, FieldBackend, FieldDeposit, FinishReport, InferenceJob, ResidentBackend, SenseInferBackend, SenseJob, SenseOutput, UptakeJob, UptakeOut};
@@ -127,6 +128,11 @@ struct Slab {
     /// network, too many layers for one binding each) has a single entry: all layers back to back.
     stride: Vec<usize>,
     packed: bool,
+    /// The packed slab stores 16-bit weights, two per word (`stride[0]` counts words, not weights).
+    half: bool,
+    /// Largest binding a page may use, and a cap on slots per page (tests / tuning).
+    max_bind: u64,
+    page_cap: usize,
     /// Weight pages: each page holds up to `page_slots` organisms in one buffer per
     /// layer, so no buffer exceeds the adapter's storage-binding limit (sharding).
     pages: Vec<Vec<wgpu::Buffer>>,
@@ -142,16 +148,50 @@ struct Slab {
     epoch: u64,
 }
 
+/// Organisms per page: as many as fit one binding, `st_words` words (of 4 bytes) each.
+fn slots_per_page(max_bind: u64, st_words: usize) -> usize {
+    (max_bind / (st_words as u64 * 4)).clamp(1, 1 << 20) as usize
+}
+
 impl Slab {
+    /// Switch a still-empty packed slab to 16-bit weights: half the words per organism, so a page holds twice as many.
+    fn enable_half(&mut self) {
+        debug_assert!(self.packed && self.pages.is_empty());
+        self.half = true;
+        self.stride[0] = self.stride[0].div_ceil(2);
+        self.page_slots = slots_per_page(self.max_bind, self.stride[0]).min(self.page_cap);
+    }
+
     fn cap(&self) -> usize {
         if self.pages.is_empty() { 0 } else { (self.pages.len() - 1) * self.page_slots + self.last_cap }
     }
+}
+
+/// All layers of one network back to back, each transposed to `[in][out]` with its biases after it.
+fn transpose_packed<T: Copy>(dims: &[(usize, usize)], params: &[T], zero: T) -> Vec<T> {
+    let total: usize = dims.iter().map(|&(i, o)| i * o + o).sum();
+    let mut tw = Vec::with_capacity(total + 1);
+    let mut off = 0;
+    for &(i, o) in dims {
+        let base = tw.len();
+        tw.resize(base + i * o + o, zero);
+        for oo in 0..o {
+            for ii in 0..i {
+                tw[base + ii * o + oo] = params[off + oo * i + ii];
+            }
+        }
+        tw[base + i * o..base + i * o + o].copy_from_slice(&params[off + i * o..off + i * o + o]);
+        off += i * o + o;
+    }
+    tw
 }
 
 struct SensePipelines {
     pipeline: wgpu::ComputePipeline,
     /// The 8-layer recurrent network (one packed weight binding, memory in and out).
     deep: wgpu::ComputePipeline,
+    /// The same network reading 16-bit weights from the packed slab.
+    deep_half: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
     pyr_level0: wgpu::ComputePipeline,
@@ -277,6 +317,111 @@ struct Timestamps {
     period_ns: f64,
 }
 
+/// Per-pass GPU timer for the single-wait front half (diagnostic, on with `--profile`): every
+/// pass of the sensing/uptake submission gets its own begin/end timestamp; averages go to stderr
+/// every 128 ticks.
+pub(crate) struct PassTimer {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    period_ns: f64,
+    active: std::cell::Cell<bool>,
+    names: std::cell::RefCell<Vec<&'static str>>,
+    sums: std::cell::RefCell<Vec<(&'static str, f64)>>,
+    ticks: std::cell::Cell<u32>,
+}
+
+impl PassTimer {
+    const MAX_PASSES: usize = 32;
+
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> PassTimer {
+        let bytes = (Self::MAX_PASSES * 16) as u64;
+        PassTimer {
+            set: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("passes"), ty: wgpu::QueryType::Timestamp, count: (Self::MAX_PASSES * 2) as u32 }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor { label: Some("passes-resolve"), size: bytes, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
+            readback: device.create_buffer(&wgpu::BufferDescriptor { label: Some("passes-read"), size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+            period_ns: queue.get_timestamp_period() as f64,
+            active: std::cell::Cell::new(false),
+            names: Default::default(),
+            sums: Default::default(),
+            ticks: std::cell::Cell::new(0),
+        }
+    }
+
+    fn begin(&self, on: bool) {
+        self.active.set(on);
+        self.names.borrow_mut().clear();
+    }
+
+    /// Timestamp writes for the next pass, or `None` when not recording.
+    fn tw(&self, name: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        if !self.active.get() {
+            return None;
+        }
+        let mut names = self.names.borrow_mut();
+        let k = names.len();
+        if k >= Self::MAX_PASSES {
+            return None;
+        }
+        names.push(name);
+        Some(wgpu::ComputePassTimestampWrites { query_set: &self.set, beginning_of_pass_write_index: Some(2 * k as u32), end_of_pass_write_index: Some(2 * k as u32 + 1) })
+    }
+
+    fn resolve(&self, enc: &mut wgpu::CommandEncoder) {
+        let k = self.names.borrow().len() as u32;
+        if k > 0 {
+            enc.resolve_query_set(&self.set, 0..2 * k, &self.resolve, 0);
+            enc.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, k as u64 * 16);
+        }
+        self.active.set(false);
+    }
+
+    fn add(&self, name: &'static str, ms: f64) {
+        let mut sums = self.sums.borrow_mut();
+        match sums.iter_mut().find(|(n, _)| *n == name) {
+            Some(e) => e.1 += ms,
+            None => sums.push((name, ms)),
+        }
+    }
+
+    /// Read the timestamps (the caller has already waited for the submission) and report every 128 ticks.
+    fn collect(&self, device: &wgpu::Device) {
+        let k = self.names.borrow().len();
+        if k == 0 {
+            return;
+        }
+        let slice = self.readback.slice(0..k as u64 * 16);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        // The submission has completed, so this poll returns at once.
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        if !matches!(rx.recv(), Ok(Ok(()))) {
+            return;
+        }
+        {
+            let view = slice.get_mapped_range().expect("pass timestamps mapped");
+            for (i, &name) in self.names.borrow().iter().enumerate() {
+                let t0 = u64::from_le_bytes(view[i * 16..i * 16 + 8].try_into().unwrap());
+                let t1 = u64::from_le_bytes(view[i * 16 + 8..i * 16 + 16].try_into().unwrap());
+                self.add(name, t1.saturating_sub(t0) as f64 * self.period_ns / 1e6);
+            }
+        }
+        self.readback.unmap();
+        let t = self.ticks.get() + 1;
+        self.ticks.set(t);
+        if t % 128 == 0 {
+            let sums = self.sums.borrow();
+            let total: f64 = sums.iter().map(|e| e.1).sum::<f64>() / 128.0;
+            let line = sums.iter().map(|(n, ms)| format!("{n} {:.2}", ms / 128.0)).collect::<Vec<_>>().join(" | ");
+            eprintln!("gpu pass ms/tick (front half, avg of 128): {line} | sum {total:.2}");
+            drop(sums);
+            self.sums.borrow_mut().clear();
+        }
+    }
+}
+
 struct Io {
     cap: usize,
     slots: wgpu::Buffer,
@@ -307,6 +452,7 @@ pub struct GpuBackend {
     /// Timestamp queries for resident uptake/finish. Used only while profiling,
     /// and only on submissions that already wait for readback.
     resident_timestamps: Option<Timestamps>,
+    pass_timer: Option<PassTimer>,
     /// Deposit passes do not wait. When profiling, their timestamp span is
     /// resolved here and read in the later finish poll. Separate query set so
     /// it does not collide with uptake/finish queries.
@@ -422,27 +568,45 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 impl GpuBackend {
     /// Open the highest-performance adapter (`WGPU_BACKEND=vulkan|dx12|metal` overrides the choice).
     pub fn new() -> Result<GpuBackend, String> {
-        pollster::block_on(Self::open())
+        pollster::block_on(Self::open(None, 0))
     }
 
-    async fn open() -> Result<GpuBackend, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, force_fallback_adapter: false, compatible_surface: None, apply_limit_buckets: false })
-            .await
-            .map_err(|e| format!("no GPU adapter found: {e}"))?;
+    /// A new backend with no organism or field state, on the same device, so a window that draws with this
+    /// device keeps working (the viewer swaps worlds with it). The pipelines are built again. Field
+    /// generations continue from this backend's, so a painter that caches by generation never mistakes the
+    /// new world's field buffers for the old ones.
+    pub fn fresh(&self) -> Result<GpuBackend, String> {
+        pollster::block_on(Self::open(Some((self.instance.clone(), self.adapter.clone(), self.device.clone(), self.queue.clone())), self.field_gen))
+    }
+
+    async fn open(existing: Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)>, field_gen: u64) -> Result<GpuBackend, String> {
+        let (instance, adapter, device, queue, limits, ts_ok) = match existing {
+            Some((instance, adapter, device, queue)) => {
+                let limits = device.limits();
+                let ts_ok = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+                (instance, adapter, device, queue, limits, ts_ok)
+            }
+            None => {
+                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, force_fallback_adapter: false, compatible_surface: None, apply_limit_buckets: false })
+                    .await
+                    .map_err(|e| format!("no GPU adapter found: {e}"))?;
+                let al = adapter.limits();
+                let mut limits = wgpu::Limits::default();
+                // Weight slabs are large: ask for everything the adapter offers here.
+                limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
+                limits.max_buffer_size = al.max_buffer_size;
+                let ts_ok = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+                let required_features = if ts_ok { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+                let (device, queue) = adapter
+                    .request_device(&wgpu::DeviceDescriptor { label: Some("frankenlife"), required_features, required_limits: limits.clone(), ..Default::default() })
+                    .await
+                    .map_err(|e| format!("could not open GPU device: {e}"))?;
+                (instance, adapter, device, queue, limits, ts_ok)
+            }
+        };
         let ai = adapter.get_info();
-        let al = adapter.limits();
-        let mut limits = wgpu::Limits::default();
-        // Weight slabs are large: ask for everything the adapter offers here.
-        limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
-        limits.max_buffer_size = al.max_buffer_size;
-        let ts_ok = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let required_features = if ts_ok { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor { label: Some("frankenlife"), required_features, required_limits: limits.clone(), ..Default::default() })
-            .await
-            .map_err(|e| format!("could not open GPU device: {e}"))?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mlp"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
         let uniform_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -473,9 +637,9 @@ impl GpuBackend {
                 if packed {
                     stride = vec![stride.iter().sum()];
                 }
-                let widest = *stride.iter().max().expect("layers") as u64 * 4;
-                let page_slots = ((limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size) / widest).clamp(1, 1 << 20) as usize;
-                Slab { dims, stride, packed, pages: Vec::new(), traits: Vec::new(), page_slots, last_cap: 0, owner: Vec::new(), last_used: Vec::new(), free: Vec::new(), epoch: 0 }
+                let max_bind = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+                let page_slots = slots_per_page(max_bind, *stride.iter().max().expect("layers"));
+                Slab { dims, stride, packed, half: false, max_bind, page_cap: usize::MAX, pages: Vec::new(), traits: Vec::new(), page_slots, last_cap: 0, owner: Vec::new(), last_used: Vec::new(), free: Vec::new(), epoch: 0 }
             })
             .collect();
         let uentry = |binding| wgpu::BindGroupLayoutEntry {
@@ -506,6 +670,14 @@ impl GpuBackend {
             compilation_options: Default::default(),
             cache: None,
         });
+        let deep_half_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("sense-deep-half"),
+            layout: Some(&spl),
+            module: &sense_module,
+            entry_point: Some("main_deep_h"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let pyr_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pyramid"), source: wgpu::ShaderSource::Wgsl(PYRAMID_SHADER.into()) });
         let pyr_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pyramid"),
@@ -525,6 +697,7 @@ impl GpuBackend {
         let sense = SensePipelines {
             pipeline: sense_pipeline,
             deep: deep_pipeline,
+            deep_half: deep_half_pipeline,
             layout: sense_layout,
             uniform: device.create_buffer(&wgpu::BufferDescriptor { label: Some("sense-dims"), size: 304, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
             pyr_level0: mkp("level0"),
@@ -658,6 +831,7 @@ impl GpuBackend {
             call: 0,
             timestamps,
             pyramid_timestamps,
+            pass_timer: None,
             input_scratch: Vec::new(),
             sense,
             field_pipes,
@@ -668,7 +842,7 @@ impl GpuBackend {
             profiling: false,
             field_resident: false,
             field_gpu: None,
-            field_gen: 0,
+            field_gen,
             res_pipes,
             resident: None,
             sense_io: None,
@@ -796,7 +970,8 @@ impl GpuBackend {
             return Err("page size can only change before the first upload".into());
         }
         for s in &mut self.slabs {
-            s.page_slots = s.page_slots.min(slots.max(1));
+            s.page_cap = slots.max(1);
+            s.page_slots = s.page_slots.min(s.page_cap);
         }
         Ok(())
     }
@@ -849,7 +1024,7 @@ impl GpuBackend {
         Ok(())
     }
 
-    fn upload(&mut self, t: usize, slot: usize, params: &[f32], motion: &[f32]) {
+    fn upload(&mut self, t: usize, slot: usize, params: &Weights, motion: &[f32]) {
         let slab = &self.slabs[t];
         {
             let (page, local) = (slot / slab.page_slots, slot % slab.page_slots);
@@ -859,23 +1034,22 @@ impl GpuBackend {
         }
         if slab.packed {
             // Every layer transposed to `[in][out]` (as the kernels read it), biases after it, layers back to back.
-            let mut tw = Vec::with_capacity(slab.stride[0]);
-            let mut off = 0;
-            for &(i, o) in &slab.dims {
-                let base = tw.len();
-                tw.resize(base + i * o + o, 0.0f32);
-                for oo in 0..o {
-                    for ii in 0..i {
-                        tw[base + ii * o + oo] = params[off + oo * i + ii];
-                    }
-                }
-                tw[base + i * o..base + i * o + o].copy_from_slice(&params[off + i * o..off + i * o + o]);
-                off += i * o + o;
-            }
             let (page, local) = (slot / slab.page_slots, slot % slab.page_slots);
-            self.queue.write_buffer(&slab.pages[page][0], (local * slab.stride[0] * 4) as u64, f32_bytes(&tw));
+            let at = (local * slab.stride[0] * 4) as u64;
+            if slab.half {
+                // 16-bit patterns, little-endian: element 2k is the low half of word k (WGSL `unpack2x16float`).
+                let mut tw = transpose_packed(&slab.dims, &params.to_f16_bits(), 0u16);
+                if tw.len() % 2 == 1 {
+                    tw.push(0);
+                }
+                self.queue.write_buffer(&slab.pages[page][0], at, bytemuck::cast_slice(&tw));
+            } else {
+                let tw = transpose_packed(&slab.dims, &params.to_f32(), 0.0f32);
+                self.queue.write_buffer(&slab.pages[page][0], at, f32_bytes(&tw));
+            }
             return;
         }
+        let params = params.to_f32();
         let mut off = 0;
         for (l, &(i, o)) in slab.dims.iter().enumerate() {
             let mut tw = vec![0.0f32; i * o + o];
@@ -1010,6 +1184,9 @@ impl GpuBackend {
             let slot = match self.slot_of.get(&g.id) {
                 Some(&(tt, s)) if tt == t => s,
                 _ => {
+                    if matches!(g.params, Weights::F16(_)) && self.slabs[t].packed && self.slabs[t].pages.is_empty() {
+                        self.slabs[t].enable_half();
+                    }
                     if self.slabs[t].free.is_empty() {
                         self.grow(t)?;
                     }
@@ -1348,7 +1525,7 @@ impl GpuBackend {
                 end_of_pass_write_index: Some(1),
             });
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("sense"), timestamp_writes: tw });
-            pass.set_pipeline(if slab.packed { &self.sense.deep } else { &self.sense.pipeline });
+            pass.set_pipeline(if slab.half { &self.sense.deep_half } else if slab.packed { &self.sense.deep } else { &self.sense.pipeline });
             pass.set_bind_group(0, &self.sense_bind.as_ref().expect("sense bind").group, &[]);
             pass.dispatch_workgroups(grid_x, grid_y, 1);
         }
@@ -1867,10 +2044,11 @@ impl GpuBackend {
         } else {
             None
         };
-        dispatch_resident(st, enc, &p.bin_count, items_grid, begin_tw);
-        dispatch_resident(st, enc, &p.bin_scan, (1, 1), None);
-        dispatch_resident(st, enc, &p.bin_scatter, items_grid, None);
-        dispatch_resident(st, enc, &p.bin_sort, cells_grid, None);
+        let pt = |name| self.pass_timer.as_ref().and_then(|t| t.tw(name));
+        dispatch_resident(st, enc, &p.bin_count, items_grid, begin_tw.or_else(|| pt("bin_count")));
+        dispatch_resident(st, enc, &p.bin_scan, (1, 1), pt("bin_scan"));
+        dispatch_resident(st, enc, &p.bin_scatter, items_grid, pt("bin_scatter"));
+        dispatch_resident(st, enc, &p.bin_sort, cells_grid, pt("bin_sort"));
     }
 
     /// Read the resident staging buffer. When `with_timestamp` is set, the
@@ -2617,6 +2795,168 @@ mod tests {
         assert!(mag > 0.0, "the reference produced a memory to compare");
         assert!(dl < 2e-3, "logits differ by {dl}");
         assert!(dm < 2e-3, "memory differs by {dm}");
+    }
+
+    /// A recurrent job that is not due skips the network on the GPU but still gets its motion drive and
+    /// density; the due ones match the CPU reference as before.
+    #[test]
+    fn recurrent_kernel_skips_jobs_that_are_not_due() {
+        let Ok(mut gpu) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut w = fl_core::World::new(recurrent_small()).unwrap();
+        for _ in 0..30 {
+            w.step().unwrap();
+        }
+        let cfg = w.cfg.clone();
+        let o = &w.orgs;
+        let genomes: Vec<fl_core::genome::Genome> = (0..o.len())
+            .map(|i| {
+                let mut g = (*o.genome[i]).clone();
+                g.id = 4_000_000 + i as u64;
+                g
+            })
+            .collect();
+        let jobs: Vec<SenseJob<'_>> = (0..o.len())
+            .map(|i| SenseJob { organism: o.id[i], genome: &genomes[i], x: o.x[i], y: o.y[i], intrinsic: [0.3, 0.1, -0.2, 0.05, 0.0], due: i % 3 == 0, memory: &o.memory[i] })
+            .collect();
+        let mut a = vec![SenseOutput::default(); jobs.len()];
+        let mut b = vec![SenseOutput::default(); jobs.len()];
+        let lv = cfg.pyramid_levels();
+        gpu.sense_and_infer(&w.field, &cfg.sensors, lv, &jobs, &mut a).unwrap();
+        fl_core::ReferenceSenseInfer.sense_and_infer(&w.field, &cfg.sensors, lv, &jobs, &mut b).unwrap();
+        let mut due = 0;
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            for k in 0..2 {
+                assert!((x.motion_drive[k] - y.motion_drive[k]).abs() <= 1e-3 * (1.0 + y.motion_drive[k].abs()), "job {i} drive {k}");
+            }
+            assert!((x.density0 - y.density0).abs() <= 1e-4 * (1.0 + y.density0.abs()), "job {i} density");
+            if jobs[i].due {
+                due += 1;
+                for k in 0..OUTPUT_WIDTH {
+                    assert!((x.logits[k] - y.logits[k]).abs() < 2e-3, "job {i} logit {k}");
+                }
+                for k in 0..MEMORY_WIDTH {
+                    assert!((x.memory[k] - y.memory[k]).abs() < 2e-3, "job {i} memory {k}");
+                }
+            }
+        }
+        assert!(due > 10 && due < jobs.len(), "a mix of due and idle jobs: {due} of {}", jobs.len());
+    }
+
+    /// A fresh backend on the same device carries nothing over from the world that came before it: a new
+    /// world (organism ids start over) steps exactly as it does on a brand new backend.
+    #[test]
+    fn fresh_backend_forgets_the_previous_world() {
+        let Ok(mut old) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        old.set_single_wait(true);
+        let mut first = fl_core::World::new(recurrent_small()).unwrap();
+        for _ in 0..8 {
+            first.step_inference(fl_core::Inference::Resident(&mut old)).unwrap();
+        }
+        let mut cfg = recurrent_small();
+        cfg.population.initial_count = 450;
+        cfg.population.maximum_count = 900;
+        let old_gen = old.field_gen;
+        let mut reused = old.fresh().unwrap();
+        reused.set_single_wait(true);
+        let mut a = fl_core::World::new(cfg.clone()).unwrap();
+        let Ok(mut other) = GpuBackend::new() else { return };
+        other.set_single_wait(true);
+        let mut b = fl_core::World::new(cfg).unwrap();
+        for _ in 0..8 {
+            a.step_inference(fl_core::Inference::Resident(&mut reused)).unwrap();
+            b.step_inference(fl_core::Inference::Resident(&mut other)).unwrap();
+        }
+        assert!(a.orgs.len() > 400, "the new world has its own, larger population");
+        assert!(old_gen >= 1 && reused.field_gen > old_gen, "field generations keep counting up across a fresh backend ({} after {old_gen})", reused.field_gen);
+        assert_eq!(a.state_hash(), b.state_hash(), "a fresh backend steps like a new one");
+    }
+
+    fn recurrent_half_small() -> Config {
+        let mut c = recurrent_small();
+        c.controller.canonical_weight_dtype = "f16".into();
+        c
+    }
+
+    /// The 16-bit kernel reads exactly the weights the 16-bit genome holds: same logits and memory as the CPU reference,
+    /// and the slab really is half the size.
+    #[test]
+    fn half_precision_recurrent_kernel_matches_cpu_reference() {
+        let Ok(mut gpu) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut w = fl_core::World::new(recurrent_half_small()).unwrap();
+        for _ in 0..30 {
+            w.step().unwrap();
+        }
+        let cfg = w.cfg.clone();
+        let o = &w.orgs;
+        assert!(o.genome.iter().all(|g| matches!(g.params, Weights::F16(_))));
+        assert!(o.memory.iter().any(|m| m.iter().any(|&v| v != 0.0)));
+        let genomes: Vec<fl_core::genome::Genome> = (0..o.len())
+            .map(|i| {
+                let mut g = (*o.genome[i]).clone();
+                g.id = 3_000_000 + i as u64;
+                g
+            })
+            .collect();
+        let jobs: Vec<SenseJob<'_>> = (0..o.len())
+            .map(|i| SenseJob { organism: o.id[i], genome: &genomes[i], x: o.x[i], y: o.y[i], intrinsic: [0.3, 0.1, -0.2, 0.05, 0.0], due: true, memory: &o.memory[i] })
+            .collect();
+        let mut a = vec![SenseOutput::default(); jobs.len()];
+        let mut b = vec![SenseOutput::default(); jobs.len()];
+        let lv = cfg.pyramid_levels();
+        gpu.sense_and_infer(&w.field, &cfg.sensors, lv, &jobs, &mut a).unwrap();
+        fl_core::ReferenceSenseInfer.sense_and_infer(&w.field, &cfg.sensors, lv, &jobs, &mut b).unwrap();
+        let (mut dl, mut dm) = (0.0f64, 0.0f64);
+        for (x, y) in a.iter().zip(&b) {
+            for k in 0..OUTPUT_WIDTH {
+                dl = dl.max((x.logits[k] - y.logits[k]).abs() as f64);
+            }
+            for k in 0..MEMORY_WIDTH {
+                dm = dm.max((x.memory[k] - y.memory[k]).abs() as f64);
+            }
+        }
+        eprintln!("16-bit recurrent fused vs reference: logits {dl:.2e}, memory {dm:.2e}");
+        assert!(dl < 2e-3, "logits differ by {dl}");
+        assert!(dm < 2e-3, "memory differs by {dm}");
+        let deep = CATALOG.iter().position(|h| is_recurrent(h)).unwrap();
+        assert!(gpu.slabs[deep].half);
+        assert_eq!(gpu.slabs[deep].stride[0], 12_980 / 2);
+        // Half the bytes per organism of the 32-bit slab (which strides 12,980 words).
+        assert_eq!(gpu.resident_bytes(), (gpu.slabs[deep].cap() * 6_490 * 4) as u64);
+    }
+
+    /// A 16-bit recurrent world runs on both resident paths, is bit-reproducible and closes its ledger.
+    #[test]
+    fn half_precision_world_runs_on_the_resident_paths() {
+        let Ok(mut g1) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut g2 = GpuBackend::new().unwrap();
+        g1.set_single_wait(true);
+        g2.set_single_wait(true);
+        let mut a = fl_core::World::new(recurrent_half_small()).unwrap();
+        let mut b = fl_core::World::new(recurrent_half_small()).unwrap();
+        for _ in 0..100 {
+            a.step_inference(fl_core::Inference::Resident(&mut g1)).unwrap();
+            b.step_inference(fl_core::Inference::Resident(&mut g2)).unwrap();
+        }
+        a.sync_field(&mut g1).unwrap();
+        b.sync_field(&mut g2).unwrap();
+        assert_eq!(a.state_hash(), b.state_hash());
+        assert!(a.orgs.memory.iter().any(|m| m.iter().any(|&v| v != 0.0)));
+        assert!(a.orgs.genome.iter().all(|g| matches!(g.params, Weights::F16(_))));
+        let l = &a.ledger;
+        let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
+        assert!((a.total_energy() - expected).abs() / l.transferred.max(1.0) < 1e-5);
     }
 
     /// A recurrent world runs on the classic and single-wait resident paths, agrees with the

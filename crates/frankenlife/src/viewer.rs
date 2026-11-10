@@ -11,7 +11,8 @@ use fl_view::{chem_basis, chem_color, lineage_color};
 use super::painter::{self, PaintStats, Painter, Planes, Scene};
 use super::render::View;
 use super::{download_field, prepare, step_world, write_checkpoint, Backend, Launch, Prepared};
-use fl_core::world::{Command, Param, TickError};
+use fl_core::world::{Command, Disposal, Param, TickError};
+use winit::keyboard::{Key, NamedKey};
 use fl_core::{Config, World, MODEL_VERSION};
 
 #[derive(clap::Parser, Debug)]
@@ -402,6 +403,14 @@ struct Session {
     tune: Tuner,
     presses: Vec<(u64, String, bool)>,
     wall0: Instant,
+    /// The config the run started from; a restart with a new organism count builds from it.
+    launch_cfg: Config,
+    /// Digits typed so far while the organism count is being entered (`None` when it is not).
+    count_entry: Option<String>,
+    /// How many times the run has been restarted with a typed count.
+    restarts: u32,
+    /// Last message about a count that could not be applied, shown on the HUD until the next key.
+    notice: Option<String>,
     #[cfg(feature = "gpu")]
     device_planes: Option<fl_gpu::FieldPlanes>,
     cpu_link: Option<painter::GpuLink>,
@@ -453,7 +462,9 @@ impl Session {
         );
         eprintln!("controls: space pause | . step | 1 realtime | 2 2x | 4 4x | 0 unlimited | tab view | drag pan | wheel zoom | click inspect | esc quit");
         eprintln!("live tuning: q/w energy | a/s source speed | d/f diffusion | c/v decay | z/x mutation | j/k chemistry drift | click a source to pick it | r reset");
+        eprintln!("organism count: p, type the number, enter (restarts the run with that many; esc cancels)");
         let tune_cfg = world.cfg.clone();
+        let launch_cfg = tune_cfg.clone();
         let tune_log = args.out.join("controls.jsonl");
         let presses: Vec<(u64, String, bool)> = args.press.iter().map(|(t, k)| (*t, k.clone(), false)).collect();
         Session {
@@ -476,10 +487,96 @@ impl Session {
             tune: Tuner::new(&tune_cfg, Some(tune_log)),
             presses,
             wall0: Instant::now(),
+            launch_cfg,
+            count_entry: None,
+            restarts: 0,
+            notice: None,
             #[cfg(feature = "gpu")]
             device_planes: None,
             cpu_link: None,
         }
+    }
+
+    /// Start a fresh world from the launch settings with `n` organisms. The window, camera and pace stay;
+    /// the GPU backend is rebuilt on the same device so no organism from the old world lingers on it.
+    fn restart_with_count(&mut self, n: u32) -> Result<(), String> {
+        let mut cfg = self.launch_cfg.clone();
+        cfg.population.initial_count = n;
+        cfg.population.maximum_count = cfg.population.maximum_count.max(n);
+        let mut world = World::new(cfg).map_err(|errs| errs.join("; "))?;
+        world.workers = self.world.workers;
+        #[cfg(feature = "gpu")]
+        let fresh = match self.gpu.as_ref() {
+            Some(g) => {
+                let mut f = g.fresh()?;
+                f.set_single_wait(self.backend == Backend::GpuRealtime);
+                Some(f)
+            }
+            None => None,
+        };
+        for &(t, x, y, r) in &self.args.erase {
+            world.schedule(t, Command::EraseDisk { x, y, radius: r, disposal: Disposal::Recycle }).map_err(|e| e.to_string())?;
+        }
+        #[cfg(feature = "gpu")]
+        {
+            self.device_planes = None;
+            self.gpu = fresh;
+        }
+        let dt = world.dt();
+        self.tick_limit = if self.args.seconds > 0.0 { Some((self.args.seconds / dt).round() as u64) } else { None };
+        self.start_tick = 0;
+        self.world = world;
+        let mut tune = Tuner::new(&self.launch_cfg, Some(self.args.out.join("controls.jsonl")));
+        tune.log = std::mem::take(&mut self.tune.log);
+        self.tune = tune;
+        self.tune.record(self.world.tick, serde_json::json!({ "restart_with_organisms": n }));
+        // Timing, checkpoints and pacing belong to the new run: the manifest's rates must not mix in the old
+        // one, and checkpoints at low ticks must not be pruned in favour of the old run's higher ones.
+        self.restarts += 1;
+        if self.ckpt_every.is_some() {
+            self.ckpt_dir = self.args.out.join("checkpoints").join(format!("restart-{}", self.restarts));
+            std::fs::create_dir_all(&self.ckpt_dir).ok();
+        }
+        let (speed, paused) = (self.pace.speed, if self.done { false } else { self.pace.paused });
+        self.pace = Pace::new();
+        self.pace.speed = speed;
+        self.pace.paused = paused;
+        self.wall0 = Instant::now();
+        self.done = false;
+        self.stop_reason = "window closed".into();
+        self.inspect = None;
+        Ok(())
+    }
+
+    /// One key while the organism count is being typed. Returns true if the key was consumed.
+    fn count_key(&mut self, key: &Key) -> bool {
+        let Some(entry) = self.count_entry.as_mut() else { return false };
+        match key {
+            Key::Character(s) if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() => {
+                if entry.len() < 7 {
+                    entry.push_str(s.as_str());
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                entry.pop();
+            }
+            Key::Named(NamedKey::Escape) => self.count_entry = None,
+            Key::Named(NamedKey::Enter) => {
+                let typed = std::mem::take(entry);
+                self.count_entry = None;
+                match typed.parse::<u32>() {
+                    Ok(n) if n >= 1 => {
+                        if let Err(e) = self.restart_with_count(n) {
+                            eprintln!("organism count {n}: {e}");
+                            self.notice = Some(format!("CANNOT START WITH {n}: {}", e.chars().take(70).collect::<String>()));
+                        }
+                    }
+                    _ => self.notice = Some("TYPE A NUMBER OF AT LEAST 1".into()),
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     fn tick_hz(&self) -> f64 {
@@ -823,6 +920,12 @@ impl Session {
             self.tune.hud_line(),
             "Q/W ENERGY  A/S SOURCE SPEED  D/F DIFFUSION  C/V DECAY  Z/X MUTATION  J/K CHEM DRIFT  CLICK SOURCE  R RESET".into(),
         ];
+        lines.push("P ORGANISM COUNT (TYPE A NUMBER, ENTER RESTARTS THE RUN)".into());
+        if let Some(entry) = &self.count_entry {
+            lines.push(format!("ORGANISMS: {entry}_   ENTER START  ESC CANCEL  (NOW {})", self.world.orgs.len()));
+        } else if let Some(n) = &self.notice {
+            lines.push(n.clone());
+        }
         if let Some(s) = &self.inspect {
             lines.push(s.clone());
         }
@@ -978,7 +1081,7 @@ fn glyph(c: char) -> &'static str {
         'S' => "011100010001110", 'T' => "111010010010010", 'U' => "101101101101111", 'V' => "101101101101010",
         'W' => "101101111111101", 'X' => "101101010101101", 'Y' => "101101010010010", 'Z' => "111001010100111",
         '.' => "000000000000010", ':' => "000010000010000", '/' => "001001010100100", '=' => "000111000111000",
-        '-' => "000000111000000", '%' => "101001010100101", '(' => "010100100100010", ')' => "010001001001010",
+        '-' => "000000111000000", '_' => "000000000000111", '%' => "101001010100101", '(' => "010100100100010", ')' => "010001001001010",
         _ => "000000000000000",
     }
 }
@@ -1285,7 +1388,7 @@ impl winit::application::ApplicationHandler for WindowApp<'_> {
 
     fn window_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, _id: winit::window::WindowId, event: winit::event::WindowEvent) {
         use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-        use winit::keyboard::{Key, NamedKey};
+
         match event {
             WindowEvent::Resized(size) => {
                 if let Some(swap) = self.swap.as_mut() {
@@ -1319,7 +1422,19 @@ impl winit::application::ApplicationHandler for WindowApp<'_> {
                     return;
                 }
                 let session = &mut *self.session;
+                session.notice = None;
+                if session.count_key(&event.logical_key) {
+                    // A run that ended and was restarted shows its final frame again when it ends.
+                    self.showed_final = false;
+                    if let Some(w) = self.swap.as_ref() {
+                        w.window.request_redraw();
+                    }
+                    return;
+                }
                 match event.logical_key {
+                    Key::Character(ref s) if s.eq_ignore_ascii_case("p") => {
+                        session.count_entry = Some(String::new());
+                    }
                     Key::Named(NamedKey::Escape) => {
                         self.wrote = true;
                         session.finish();
@@ -1626,6 +1741,75 @@ mod tests {
         }
         assert_eq!(a.state_hash(), b.state_hash());
         assert_eq!(a.orgs, b.orgs);
+    }
+
+    fn tiny_session() -> Session {
+        use clap::Parser;
+        let args = ViewArgs::parse_from(["view", "--out", "target/viewer-count-test"]);
+        let world = World::new(tiny_config()).unwrap();
+        let report = world.cfg.validate().unwrap();
+        Session::from_prepared(args, Prepared { world, #[cfg(feature = "gpu")] gpu: None, ts_supported: None, report, start_tick: 0 })
+    }
+
+    fn typed(s: &mut Session, keys: &[Key]) {
+        for k in keys {
+            assert!(s.count_key(k), "the count entry takes the key");
+        }
+    }
+
+    #[test]
+    fn typing_a_count_restarts_the_run_with_that_many_organisms() {
+        let mut s = tiny_session();
+        for _ in 0..5 {
+            s.step_one().unwrap();
+        }
+        assert_eq!(s.world.orgs.len(), 24);
+        assert!(s.world.tick >= 5);
+        s.count_entry = Some(String::new());
+        typed(&mut s, &[Key::Character("3".into()), Key::Character("0".into()), Key::Character("9".into()), Key::Named(NamedKey::Backspace), Key::Character("1".into()), Key::Named(NamedKey::Enter)]);
+        assert!(s.count_entry.is_none());
+        assert_eq!(s.world.orgs.len(), 301, "3, 0, 9, backspace, 1 types 301");
+        assert_eq!(s.world.tick, 0, "a fresh world");
+        assert!(s.world.cfg.population.maximum_count >= 301, "room for the larger count");
+        s.step_one().unwrap();
+        assert_eq!(s.world.tick, 1);
+    }
+
+    #[test]
+    fn a_restart_starts_timing_and_checkpoints_afresh() {
+        use clap::Parser;
+        let out = std::env::temp_dir().join(format!("fl-restart-test-{}", std::process::id()));
+        let args = ViewArgs::parse_from(["view", "--out", out.to_str().unwrap(), "--checkpoint-every", "0.01"]);
+        let world = World::new(tiny_config()).unwrap();
+        let report = world.cfg.validate().unwrap();
+        let mut s = Session::from_prepared(args, Prepared { world, #[cfg(feature = "gpu")] gpu: None, ts_supported: None, report, start_tick: 0 });
+        for _ in 0..4 {
+            s.step_one().unwrap();
+        }
+        s.pace.frames = 9;
+        s.pace.present_ms = 3.0;
+        s.pace.speed = Speed::Realtime(2.0);
+        let before = s.ckpt_dir.clone();
+        s.restart_with_count(40).unwrap();
+        assert!(s.pace.sim_ms == 0.0 && s.pace.frames == 0 && s.pace.present_ms == 0.0, "timing counters start over");
+        assert!(matches!(s.pace.speed, Speed::Realtime(m) if m == 2.0), "the chosen speed stays");
+        assert_ne!(s.ckpt_dir, before, "the new run writes its checkpoints in its own folder");
+        assert!(s.ckpt_dir.is_dir());
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn escape_cancels_the_count_and_a_bad_count_is_refused() {
+        let mut s = tiny_session();
+        s.count_entry = Some(String::new());
+        typed(&mut s, &[Key::Character("7".into()), Key::Named(NamedKey::Escape)]);
+        assert!(s.count_entry.is_none());
+        assert_eq!(s.world.orgs.len(), 24, "nothing changed");
+        s.count_entry = Some(String::new());
+        typed(&mut s, &[Key::Named(NamedKey::Enter)]);
+        assert!(s.notice.is_some(), "an empty entry is refused");
+        assert_eq!(s.world.orgs.len(), 24);
+        assert!(!s.count_key(&Key::Character("q".into())), "keys are not taken when no count is being typed");
     }
 
     fn tiny_config() -> fl_core::Config {
