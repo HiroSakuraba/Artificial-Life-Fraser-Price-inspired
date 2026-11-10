@@ -1,0 +1,24 @@
+[package]
+name = "frankenlife"
+description = "FrankenLife command-line runner, headless renderer and inspector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fl-core = { path = "../fl-core" }
+fl-view = { path = "../fl-view" }
+fl-gpu = { path = "../fl-gpu", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+png.workspace = true
+clap.workspace = true
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "1.0.1"
+wgpu = "30.0.1"
+winit = "0.30"
+
+[features]
+default = ["gpu"]
+# GPU inference through wgpu (Vulkan / DX12 / Metal).
+gpu = ["dep:fl-gpu"]
